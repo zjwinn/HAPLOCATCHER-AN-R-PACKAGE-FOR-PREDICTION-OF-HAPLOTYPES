@@ -1,0 +1,459 @@
+---
+title: "Analysis for HC in SF"
+author: "Zach Winn"
+date: "2023-03-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r analysis}
+#clear list
+remove(list=ls())
+
+#set wd
+setwd("C:/Users/zwinn/OneDrive/Publication/Manuscripts In Progress/HC for SF/Analysis")
+
+#library 
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+
+#read in data
+pheno<-read.csv("pheno_coded.csv")
+g_mat<-read.csv(gzfile("geno_coded.csv"))
+rownames(g_mat)=g_mat[,1]
+g_mat=g_mat[,-1]
+g_mat=g_mat-1
+g_mat=as.matrix(g_mat)
+grm=sommer::A.mat(g_mat)
+comp<-read.csv("gene_comp_coded.csv")
+info<-read.csv("marker_info.csv")
+
+#make sure things are in correct format
+pheno[,1:7]<-lapply(pheno[,1:7], as.factor)
+pheno[,8:9]<-lapply(pheno[,8:9], as.numeric)
+pheno$sst1_solid_stem_call=as.factor(pheno$sst1_solid_stem_call)
+pheno$Cutting_Score=as.numeric(pheno$Cutting_Score)
+
+#define training and test 
+training_genotypes=comp$FullSampleName
+testing_genotypes=as.character(unique(pheno$FullSampleName))
+
+#check
+check<-list.files()[grep("predictions.RData", list.files())]
+
+if(length(check)>0){
+  
+  print("Predictions already completed for sst1. Moving on!")
+  load(check)
+  remove(check)
+  
+}else{
+
+  #run auto_locus
+  gene_pred<-HaploCatcher::auto_locus(geno_mat = g_mat,
+                                      gene_file = comp,
+                                      marker_info = info,
+                                      gene_name = "sst1_solid_stem",
+                                      chromosome = "3B",
+                                      training_genotypes = training_genotypes,
+                                      testing_genotypes = testing_genotypes,
+                                      predict_by_vote = TRUE,
+                                      include_hets = TRUE,
+                                      parallel = TRUE,
+                                      include_models = TRUE,
+                                      n_perms = 100,
+                                      n_votes = 100)
+  
+  #save plot
+  ggsave(filename = "cross_validation_paraemters.png",
+         device = "png",
+         plot = last_plot(),
+         dpi = 320,
+         height = 8,
+         width = 12)
+  
+  varimp<-c()
+
+  #plot importance
+  for(i in names(gene_pred$cross_validation_results$Raw_Permutation_Info)){
+    
+    a<-gene_pred$cross_validation_results$Raw_Permutation_Info[[i]]$trained_models$rf
+    b<-gene_pred$cross_validation_results$Raw_Permutation_Info[[i]]$trained_models$knn
+    
+    knn<-caret::varImp(a)$importance %>%
+      rownames_to_column("Marker") %>%
+      separate(Marker, into=c("Chromosome", "BP_Position"), sep="_", remove = FALSE) %>%
+      mutate(Chromosome=gsub("S", "", Chromosome),
+             BP_Position=as.numeric(BP_Position),
+             Model="K-Nearest Neighbors", 
+             Permutation=i) %>%
+      rename(Importance=Overall) %>%
+      select(Permutation,
+             Model,
+             Marker, 
+             Chromosome,
+             BP_Position,
+             Importance)
+      
+    rf<-caret::varImp(b)$importance %>%
+      rownames_to_column("Marker") %>%
+      select(Marker, sst1_solid_stem) %>%
+      separate(Marker, into=c("Chromosome", "BP_Position"), sep="_", remove = FALSE) %>%
+      mutate(Chromosome=gsub("S", "", Chromosome),
+             BP_Position=as.numeric(BP_Position),
+             Model="Random Forest", 
+             Permutation=i) %>%
+      rename(Importance=sst1_solid_stem) %>%
+      select(Permutation,
+             Model,
+             Marker, 
+             Chromosome,
+             BP_Position,
+             Importance)
+    varimp<-rbind(varimp, knn, rf)
+    remove(a,b,knn,rf)
+  }
+  
+  #summarize importance
+  sumvarimp<-varimp %>%
+    group_by(Model, Marker, BP_Position) %>%
+    summarise(Mean_Importance=mean(Importance))
+  
+  a<-marker_list<-unique(sumvarimp$Marker)
+  write.csv(a,
+            "marker_list.csv",
+            row.names = F)
+  
+  
+  #visualize importance and LD
+  a<-ggplot(data = sumvarimp, aes(x=BP_Position/1000000, y=Mean_Importance, color=Model, shape=Model))+
+    geom_point(size=2.2)+
+    theme_bw()+
+    labs(y="Mean Importance Value",
+         x="Megabase Pair (Mbp) Position")
+  a
+  
+  b<-ggplot(data = sumvarimp %>% filter(BP_Position>200000000), aes(x=BP_Position/1000000, y=Mean_Importance, color=Model, shape=Model))+
+    geom_point(size=2.2)+
+    theme_bw()+
+    labs(y="Mean Importance Value",
+         x="Megabase Pair (Mbp) Position")+
+    geom_vline(xintercept = 828500000/1000000, color="black", lty=2, linewidth=1.2)+
+    geom_vline(xintercept = 830600000/1000000,  color="black", lty=2, linewidth=1.2)+
+    annotate('rect', xmin=828500000/1000000, xmax=830600000/1000000, ymin=0, ymax=100, alpha=.4, fill="gray")+
+    geom_text(label="Sst1 Region", x=mean(c(828.5,830.6)), y=75, angle=90, color="black", size=4)
+  b
+  
+  c<-read.csv("ld_important_markers.csv")
+  rownames(c)=c$X
+  c=c[,-1]
+  c=as.matrix(c)
+  c=reshape2::melt(c)
+  c=c %>%
+    separate(Var1, into = c("junk", "Var1"), sep = "_") %>%
+    separate(Var2, into = c("junk", "Var2"), sep = "_") %>%
+    mutate(Var1=round(as.numeric(Var1)/1000000, 3),
+           Var2=round(as.numeric(Var2)/1000000, 3),
+           Var1=factor(Var1, levels=unique(Var1)),
+           Var2=factor(Var2, levels=unique(Var2)),
+           value=as.numeric(value)) %>%
+    select(Var1, Var2, value)
+  
+  d<-ggplot(data = c, aes(x=Var1, y=Var2, fill=as.numeric(value)))+
+    geom_tile()+
+    scale_fill_gradient(high = "#F8766D", low="white")+
+    theme_bw()+
+    labs(x='Megabase Pair (Mbp) Position',
+         y='Megabase Pair (Mbp) Position')+
+    guides(fill = guide_legend(title = "LD"))+
+    theme(axis.text.x = element_text(angle = 90))+
+    annotate('rect',
+             xmin = "159.018", 
+             xmax = "832.861", 
+             ymin = "159.018", 
+             ymax = "832.861", 
+             color = "black",
+             lty=1,
+             linewidth=1,
+             alpha=0)+
+    geom_text(aes(label="Sst1 Region", x="828.615", y="837.065"))
+  d
+  
+  e<-d+(a/b)+plot_layout(guides = "collect")+plot_annotation(tag_levels = "A")
+  e
+  
+  ggsave(filename = "ld_and_importance.png",
+         plot = e,
+         device = "png",
+         dpi = 320,
+         height = 8,
+         width = 15)
+  
+  
+  #save image
+  save.image(file = "sst1_locus_predictions.RData")
+  
+}
+
+#write out results
+a<-gene_pred$cross_validation_results$Overall_Summary
+write.csv(a, "Overall_CV_Summary.csv", row.names = FALSE)
+b<-gene_pred$cross_validation_results$By_Class_Summary %>%
+  mutate(Class=ifelse(Class=="sst1_solid_stem", "+/+",
+                      ifelse(Class=="het_sst1_solid_stem", "+/-",
+                             ifelse(Class=="non_sst1_solid_stem", "-/-", "ERROR"))),
+         Class=factor(Class, levels=c("+/+", "+/-", "-/-"))) %>%
+  arrange(Class, Model)
+write.csv(b, "By_Class_CV_Summary.csv", row.names = FALSE)
+
+#get rid of the model info to free up system
+gene_pred$cross_validation_results$Raw_Permutation_Info=NULL
+
+#make a table
+freq_train<-as.data.frame(table(comp$Call)) %>%
+  rename(Training=Freq)
+freq_test<-pheno %>%
+  distinct(FullSampleName, sst1_solid_stem_call)
+freq_test<-as.data.frame(table(freq_test$sst1_solid_stem_call)) %>%
+  rename(Testing=Freq)
+
+#process table
+freq<-cbind(freq_train, freq_test$Testing)
+colnames(freq)<-c("Haplotype", "Training", "Testing")
+freq<-freq %>%
+  mutate(Training_Total=sum(Training),
+         Testing_Total=sum(Testing),
+         Training_Freq=Training/Training_Total,
+         Testing_Freq=Testing/Testing_Total) %>%
+  select(Haplotype, Training, Training_Freq, Testing, Testing_Freq) %>%
+  mutate(Haplotype=ifelse(Haplotype=="sst1_solid_stem", "+/+",
+                      ifelse(Haplotype=="het_sst1_solid_stem", "+/-",
+                             ifelse(Haplotype=="non_sst1_solid_stem", "-/-", "ERROR"))),
+         Haplotype=factor(Haplotype, levels=c("+/+", "+/-", "-/-"))) %>%
+  arrange(Haplotype)
+
+write.csv(freq, 
+          "Test_Train_Freqs.csv",
+          row.names = FALSE)
+  
+#merge in predictions
+gene_cons_pred<-gene_pred$consensious_predictions[,1:2]
+pheno<-pheno %>%
+  left_join(gene_cons_pred, by="FullSampleName") %>%
+  dplyr::select(1:10, Consensious_Call, everything()) %>%
+  mutate(Consensious_Call=as.factor(Consensious_Call)) %>%
+  drop_na(sst1_solid_stem_call) %>%
+  drop_na(FullSampleName)
+
+pheno$Consensious_Call<-factor(pheno$Consensious_Call, levels = c("sst1_solid_stem",
+                                                                  "het_sst1_solid_stem",
+                                                                  "non_sst1_solid_stem"))
+pheno$sst1_solid_stem_call<-factor(pheno$sst1_solid_stem_call, levels = c("sst1_solid_stem",
+                                                                          "het_sst1_solid_stem",
+                                                                          "non_sst1_solid_stem"))
+
+#subset grm
+grm_sub<-grm[rownames(grm) %in% pheno$FullSampleName,
+             colnames(grm) %in% pheno$FullSampleName]
+
+#run mixed linear model to estimate marker effects
+fit1<-sommer::mmer(fixed = Cutting_Score ~ sst1_solid_stem_call,
+                   random = ~ sommer::vsr(FullSampleName, Gu=grm_sub)+sommer::vsr(Environment)+sommer::spl2Da(Row,Column),
+                   rcov = ~ units,
+                   data = pheno,
+                   verbose = TRUE)
+summary(fit1)
+pred_actual<-sommer::predict.mmer(fit1, classify = "sst1_solid_stem_call")
+
+fit2<-sommer::mmer(fixed = Cutting_Score ~ Consensious_Call,
+                   random = ~ sommer::vsr(FullSampleName, Gu=grm_sub)+sommer::vsr(Environment)+sommer::spl2Da(Row,Column),
+                   rcov = ~ units,
+                   data = pheno,
+                   verbose = TRUE)
+summary(fit2)
+pred_imp<-sommer::predict.mmer(fit2, classify = "Consensious_Call")
+
+#format and merge
+pred_actual<-pred_actual$pvals %>%
+  rename(call=sst1_solid_stem_call) %>%
+  mutate(method="KASP")
+pred_imp<-pred_imp$pvals %>%
+  rename(call=Consensious_Call) %>%
+  mutate(method="Prediction")
+preds<-rbind(pred_actual,
+             pred_imp)
+preds$call<-ifelse(preds$call=="sst1_solid_stem", "+/+",
+                   ifelse(preds$call=="het_sst1_solid_stem", "+/-",
+                          ifelse(preds$call=="non_sst1_solid_stem", "-/-", "ERROR")))
+preds$call<-factor(preds$call, levels = c("+/+", "+/-", "-/-"))
+
+#make image of KASP vs Predicted
+plot1<-ggplot(data = preds, aes(y=predicted.value, x=call, fill=method))+
+  geom_errorbar(aes(ymin=(predicted.value-(standard.error*1.96)), ymax=(predicted.value+(standard.error*1.96))), position = position_dodge(width = 1))+
+  geom_label(aes(label=round(predicted.value, 1)),position = position_dodge(width = 1))+
+  theme_bw()+
+  labs(y="Visual Cutting Score Rating BLUE (1-9)",
+       x="Allelic State")+
+  guides(fill = guide_legend(title = "Method of Haplotyping"))
+plot1
+ggsave(filename = "comparison_of_pred_vs_actual_effects.png",
+       device = "png",
+       plot = plot1,
+       height = 4,
+       width = 8,
+       dpi = 320)
+
+
+#calculate confusion matrix
+a<-pheno %>% distinct(FullSampleName, Consensious_Call) %>% arrange(FullSampleName) %>% dplyr::select(Consensious_Call)
+b<-pheno %>% distinct(FullSampleName, sst1_solid_stem_call) %>% arrange(FullSampleName) %>% dplyr::select(sst1_solid_stem_call)
+confu<-caret::confusionMatrix(a$Consensious_Call,b$sst1_solid_stem_call)
+confu_by_class<-as.data.frame(confu$byClass) %>% 
+  rownames_to_column(var = "call") %>%
+  mutate(call = gsub("Class: ", "", call),
+         call = ifelse(call=="sst1_solid_stem", "+/+",
+                       ifelse(call=="het_sst1_solid_stem", "+/-",
+                              ifelse(call=="non_sst1_solid_stem", "-/-", "ERROR"))))
+confu_by_class<-rbind(data.frame(call=confu_by_class$call,
+                                 metric="Sensitivity",
+                                 y=confu_by_class$Sensitivity),
+                      data.frame(call=confu_by_class$call,
+                                 metric="Specificity",
+                                 y=confu_by_class$Specificity),
+                      data.frame(call=confu_by_class$call,
+                                 metric="Balanced Accuracy",
+                                 y=confu_by_class$`Balanced Accuracy`))
+confu_by_class$call<-factor(confu_by_class$call, levels = c("+/+", "+/-", "-/-"))
+
+#plot results
+plot2<-ggplot(data = confu_by_class, aes(x=call, y=y))+
+  geom_col(fill="gray")+
+  geom_text(aes(label=round(y, digits = 2)), vjust=2)+
+  facet_wrap(~metric, ncol = 1)+
+  theme_bw()+
+  labs(y="Metric",
+       x="Allelic State")+
+  theme(legend.position = "none")
+plot2
+ggsave(filename = "performance_metrics.png",
+       device = "png",
+       plot = plot2,
+       height = 8,
+       width = 8,
+       dpi = 320)
+
+#plot
+plot1<-plot1+theme(axis.title.x = element_blank())
+plot3<-(plot1/plot2) + plot_annotation(tag_levels = "A")
+plot3
+ggsave(filename = "composit_image.png",
+       device = "png",
+       plot = plot3,
+       height = 10,
+       width = 8,
+       dpi = 320)
+
+#look at confusion matrix
+confu_mat<-as.matrix(confu$table)
+colnames(confu_mat)=c("+/+", "+/-", "-/-")
+rownames(confu_mat)=c("+/+", "+/-", "-/-")
+write.csv(confu_mat,
+          "confusion_matrix.csv")
+
+#within site statistics
+plot_dat<-pheno %>%
+  mutate(Environment=paste("Year = ", Year, "; Location = ", Experiment, "; Nursery = ", Nursery, sep = ""),
+         Environment=gsub("Wss_", "", Environment, ignore.case = TRUE),
+         Environment=str_to_title(Environment),
+         Environment=gsub("ayn", "AYN", Environment, ignore.case = TRUE),
+         Environment=gsub("wss", "WSS", Environment, ignore.case = TRUE),
+         Environment=gsub("_", " ", Environment),
+         Environment=gsub("raymer", "Raymer", Environment))
+  
+#statistics within site
+stats<-c()
+
+for(i in unique(plot_dat$Environment)){
+  
+  a<-plot_dat[plot_dat$Environment==i,]
+  sep_dat<-data.frame(Environment=i) %>%
+    separate(col = Environment, into = c("a", "b", "c"), sep=c(";")) %>%
+    mutate(a=gsub("Year = ", "", a),
+           b=gsub("Location = ", "", b),
+           b=str_to_title(b),
+           c=gsub("Nursery = ", "", c))
+  b<-as.numeric(summary(a$Cutting_Score))
+  c<-sd(a$Cutting_Score, na.rm = TRUE)
+  d<-grm[rownames(grm) %in% a$FullSampleName,
+         colnames(grm) %in% a$FullSampleName]
+  fit<-sommer::mmer(fixed = Cutting_Score ~ 1,
+                    random = ~ sommer::vsr(FullSampleName, Gu=d),
+                    rcov = ~ units,
+                    data = a,
+                    verbose = FALSE)
+  h2<-sommer::vpredict(fit, h2 ~ (V1) / (V1+V2))
+  e<-nrow(a %>% drop_na(Cutting_Score))
+  f<-length(unique(a$ID))
+  g<-data.frame(Year = sep_dat$a,
+                Location = sep_dat$b,
+                Nursery = sep_dat$c,
+                `N Observations` = e,
+                `N Genotypes`=f,
+                Min = b[1],
+                Mean = b[4],
+                Max = b[6],
+                SD = c,
+                h2 = h2$Estimate,
+                h2_se = h2$SE,
+                check.names = FALSE)
+  stats=rbind(stats, g)
+  remove(a,b,c,d,e,f,g,fit,h2)
+  
+}
+
+plot4<-ggplot(data=plot_dat, aes(x=Cutting_Score, fill=Environment))+
+  geom_histogram(bins = length(unique(pheno$Cutting_Score)), color="black")+
+  facet_wrap(~Environment)+
+  labs(y="N Observations",
+       x="Cutting Visual Score (1-9)")+
+  theme_bw()+
+  theme(strip.text = element_blank(),
+        strip.background = element_blank(),
+        legend.position = "bottom",
+        panel.border = element_rect(colour = "black", fill=NA),
+        legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "black"))+
+  scale_x_continuous(breaks = rep(0:9))
+plot4
+plot5<-ggplot(data = plot_dat, aes(sample=Cutting_Score, color=Environment))+
+  geom_qq()+
+  geom_qq_line()+
+  facet_wrap(~Environment)+
+  labs(y="Observed", x="Theoretical")+
+  theme_bw()+
+  theme(strip.text = element_blank(),
+        strip.background = element_blank(),
+        legend.position = "none")
+plot5
+
+plot6<-plot5/plot4+
+  plot_annotation(tag_levels="A")
+plot6
+
+ggsave(filename = "pheno_stats.png",
+       device = "png",
+       plot = plot6,
+       height = 6,
+       width = 11,
+       dpi = 320)
+
+write.csv(stats,
+          "pheno_stats.csv",
+          row.names = FALSE)
+
+length(unique(comp$FullSampleName))
+```
